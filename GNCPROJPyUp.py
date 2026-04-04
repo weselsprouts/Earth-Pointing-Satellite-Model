@@ -19,11 +19,12 @@ sqrt = np.sqrt
 kep0 = np.array([15.49442598, 0.0007785, 51.6334*pi/180, 312.1983*pi/180, 38.3265*pi/180, 321.8276*pi/180, .00016677])
 ain = ((3.986e5)/((kep0[0]*2*pi/24/60/60)**2))**(1/3)
 T = 2*pi*sqrt((ain**3)/(3.986e5))
+rng = np.random.default_rng()
 
 # initial state
 s0 = np.concatenate([quat0.reshape(-1, 1), w0.reshape(-1, 1), hrw0.reshape(-1, 1)])
-tspan = [0, T]
-teval = np.linspace(0, T, 20500)
+
+s0flat = s0.flatten()
 
 
 
@@ -383,15 +384,130 @@ def magfield(t, rvec):
     B = (1/rmag**5) * (3 * np.dot(mhat.T, rvec)*rvec - rmag**2 * mhat)
     return B.reshape(3,1)
 
+def DetumDynamics(t, sflat, J, kep0):
+    s = sflat.reshape(-1,1)
+    
+    # Extract current state
+    quatcur = s[0:4]/np.linalg.norm(s[0:4])
+    wcur = s[4:7]
+    hrwcur = s[7:10]
+
+    # Current pos and vel vector
+    rvec, vvec = orbitprop(t, kep0)
+
+    # Get magnetic field and compute b-dot control
+    BECI = magfield(t, rvec).reshape(3,1)
+    BN = BECI / np.linalg.norm(BECI)
+    BB = (quat2dcm(quatcur) @ BN).reshape(3,1)
+
+    # B-dot control law
+    k = 1e-4
+    b = BB / np.linalg.norm(BB)
+    m = k/ (np.linalg.norm(BB)) * (np.cross(wcur, b, axis=0))
+
+    # Torque
+    taumag = np.cross(m, BB, axis=0)
+    quaterr, werr, RBL = errorfunc(t, rvec, vvec, quatcur, wcur, kep0)
+    tauext = exttorque(rvec, vvec, J, RBL)
+
+    wdot = (Jinv) @ (tauext.reshape(-1,1) + taumag - np.cross(wcur, J @ wcur, axis=0))
+    quatdot = kinematics(quatcur, wcur)
+    hrwdot = np.zeros((3,1))
+
+    sdot = np.concatenate([quatdot, wdot, hrwdot])
+    return sdot.flatten()
+
+def DetDone(t, sflat, J, kep0):
+    wcur = sflat[4:7]
+    wthresh = 0.5 * pi/180
+    return np.linalg.norm(wcur) - wthresh
+
+# Detumbling Mode
+
+DetDone.terminal = True
+DetDone.direction = -1
+
+solDet = solve_ivp(
+    fun = DetumDynamics,
+    t_span = [0, 3*T],
+    y0 = s0flat,
+    args = (J, kep0),
+    method = 'RK45',
+    events = DetDone
+)
+
+thand = solDet.t[-1]
+s0point = solDet.y[:, -1]
+
+# Use the time at which detumbling ends to get an attitude measurement using sun sensor and magnetometer for TRIAD method
+quathand = s0point[0:4]
+whand = s0point[4:7]
+
+rvecdet, vvecdet = orbitprop(thand, kep0)
+
+BECIdet = magfield(thand, rvecdet).reshape(3,1)
+BNdet = BECIdet / np.linalg.norm(BECIdet)
+BBtruedet = quat2dcm(quathand) @ BNdet
+BBmeasdet = BBtruedet + rng.normal(0, 1.5*pi/180, (3, 1))
+BBmeasdet /= np.linalg.norm(BBmeasdet)
+
+sNdet = ssvec(thand)
+sBtruedet = quat2dcm(quathand) @ sNdet
+sBmeasdet = sBtruedet + rng.normal(0, 0.67*pi/180, (3,1))
+sBmeasdet /= np.linalg.norm(sBmeasdet)
+
+# TRIAD method for initial pointing quaternion
+
+t1b = BBmeasdet
+t2b = np.cross(BBmeasdet, sBmeasdet, axis=0) / np.linalg.norm(np.cross(BBmeasdet, sBmeasdet, axis=0))
+t3b = np.cross(t1b, t2b, axis=0)
+
+t1r = BNdet
+t2r = np.cross(BNdet, sNdet, axis=0) / np.linalg.norm(np.cross(BNdet, sNdet, axis=0))
+t3r = np.cross(t1r, t2r, axis=0)
+
+Mb = np.column_stack([t1b, t2b, t3b])
+Mr  = np.column_stack([t1r,  t2r,  t3r])
+
+DCM0 = Mb @ Mr.T
+quat0p = dcm2quat(DCM0)
+
+
+# Plotting the detumbling
+
+wdet = solDet.y[4:7, :]
+wmag = np.linalg.norm(wdet, axis=0)
+
+plt.figure()
+plt.subplot(2, 1, 1)
+plt.plot(solDet.t, wdet[0, :], 'r', label='wx')
+plt.plot(solDet.t, wdet[1, :], 'g', label='wy')
+plt.plot(solDet.t, wdet[2, :], 'b', label='wz')
+plt.axhline(y=0.5*pi/180, color='k', linestyle='--', label='Threshold (0.5 deg/s)')
+plt.axhline(y=-0.5*pi/180, color='k', linestyle='--')
+plt.ylabel("Angular Velocity (rad/s)")
+plt.legend()
+plt.title("Detumbling Phase")
+
+plt.subplot(2, 1, 2)
+plt.plot(solDet.t, wmag, 'k', label='|ω|')
+plt.axhline(y=0.5*pi/180, color='r', linestyle='--', label='Threshold')
+plt.xlabel("Time (seconds)")
+plt.ylabel("|ω| (rad/s)")
+plt.legend()
+plt.show(block=False)
+
+
 # Set up MEKF
-s0flat = s0.flatten()
+tspan = [0, T]
+teval = np.linspace(thand, thand + T, 20500)
 time = teval
 
 # Initialize variables
 
 tauctrl = np.array([0, 0 , 0])
 xtrue = np.zeros((len(teval), 10))
-xtrue[0, :] = s0flat
+xtrue[0, :] = s0point
 
 quatetrueplt = []
 wetrueplt = []
@@ -399,7 +515,7 @@ currentstateplt = s0flat
 
 # Initial Error
 r0, v0 = orbitprop(teval[0], kep0)
-q_err0, w_err0, RBL0 = errorfunc(teval[0], r0, v0, quat0.reshape(-1,1), w0.reshape(-1,1), kep0)
+q_err0, w_err0, RBL0 = errorfunc(teval[0], r0, v0, s0point[0:4].reshape(-1,1), s0point[4:7].reshape(-1,1), kep0)
 quatetrueplt = [q_err0.flatten()]
 wetrueplt = [w_err0.flatten()]
 hrwtrueplt = [hrw0.flatten()]
@@ -408,10 +524,9 @@ quateKFplt = []
 weKFplt = []
 yplt = []
 
-# MEKF Gains
+# MEKF Gains 
 
 # Gyro Bias
-rng = np.random.default_rng()
 sigv = 0.2 * (pi/180) / sqrt(3600)
 # sigv = 0.001
 sigu = 1e-6
@@ -444,7 +559,7 @@ xhat = np.zeros((len(teval), 7))
 q0noisy = quat0.reshape(-1, 1) + 0.0001 * np.random.randn(4, 1)
 q0noisy = q0noisy/np.linalg.norm(q0noisy)
 
-xhat[0, :] = np.concatenate([q0noisy, beta_est_prior]).flatten()
+xhat[0, :] = np.concatenate([quat0p, beta_est_prior]).flatten()
 
 for j in tqdm(range(1, len(teval)), desc="Simulating"):
     truespan = [teval[j-1], teval[j]]
